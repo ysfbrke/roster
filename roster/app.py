@@ -905,10 +905,14 @@ def render_roster_editor(schema: dict[str, object], hide_employee: bool = False)
         display_diffs = remove_employee_number_columns(diffs, schema) if hide_employee else diffs
         st.dataframe(display_diffs, use_container_width=True, hide_index=True)
         if st.button("✅ Evet, değişikliği aktif listeye kaydet", type="primary"):
-            new_active_df = active_df.copy()
-            new_saved_df = saved_df.copy()
-            new_active_df.loc[computed_edited_df.index, computed_edited_df.columns] = computed_edited_df
-            new_saved_df.loc[computed_edited_df.index, computed_edited_df.columns] = computed_edited_df
+            # Streamlit Cloud / Pandas 3 + Arrow string uyumluluğu:
+            # .loc ile Arrow string sütunlarına DataFrame toplu atama TypeError verebildiği için
+            # kayıt öncesi tüm tabloyu normal Python object tipine çeviriyoruz.
+            computed_to_save = computed_edited_df.copy().astype("object").where(pd.notna(computed_edited_df), "")
+            new_active_df = active_df.copy().astype("object")
+            new_saved_df = saved_df.copy().astype("object")
+            new_active_df.loc[computed_to_save.index, computed_to_save.columns] = computed_to_save
+            new_saved_df.loc[computed_to_save.index, computed_to_save.columns] = computed_to_save
             st.session_state["active_roster_df"] = new_active_df.copy()
             st.session_state["saved_roster_df"] = new_saved_df.copy()
             st.markdown("<div class='success-card'>Değişiklikler aktif listeye kaydedildi. Total Working Time otomatik güncellendi.</div>", unsafe_allow_html=True)
@@ -916,10 +920,14 @@ def render_roster_editor(schema: dict[str, object], hide_employee: bool = False)
     else:
         if not computed_edited_df.equals(saved_editor_df):
             if st.button("✅ Değişiklikleri aktif listeye kaydet", type="primary"):
-                new_active_df = active_df.copy()
-                new_saved_df = saved_df.copy()
-                new_active_df.loc[computed_edited_df.index, computed_edited_df.columns] = computed_edited_df
-                new_saved_df.loc[computed_edited_df.index, computed_edited_df.columns] = computed_edited_df
+                # Streamlit Cloud / Pandas 3 + Arrow string uyumluluğu:
+                # .loc ile Arrow string sütunlarına DataFrame toplu atama TypeError verebildiği için
+                # kayıt öncesi tüm tabloyu normal Python object tipine çeviriyoruz.
+                computed_to_save = computed_edited_df.copy().astype("object").where(pd.notna(computed_edited_df), "")
+                new_active_df = active_df.copy().astype("object")
+                new_saved_df = saved_df.copy().astype("object")
+                new_active_df.loc[computed_to_save.index, computed_to_save.columns] = computed_to_save
+                new_saved_df.loc[computed_to_save.index, computed_to_save.columns] = computed_to_save
                 st.session_state["active_roster_df"] = new_active_df.copy()
                 st.session_state["saved_roster_df"] = new_saved_df.copy()
                 st.success("Değişiklikler kaydedildi. Total Working Time otomatik güncellendi.")
