@@ -624,7 +624,10 @@ def calculate_days_off(df: pd.DataFrame, day_cols: list[str]) -> pd.Series:
 
 def compare_weekly_hours(saved_df: pd.DataFrame, edited_df: pd.DataFrame, schema: dict[str, object]) -> pd.DataFrame:
     day_cols: list[str] = list(schema["day_cols"])  # type: ignore[arg-type]
-    old_minutes, new_minutes = calculate_weekly_minutes_contextual(saved_df, edited_df, day_cols)
+    # Total Planned Working Time mantığı: Pazartesi-Pazar hücrelerindeki
+    # köşeli parantez [] içinde yazan saatler toplanır.
+    old_minutes = calculate_weekly_minutes(saved_df, day_cols)
+    new_minutes = calculate_weekly_minutes(edited_df, day_cols)
     diff = new_minutes - old_minutes
     mask = diff != 0
     if not mask.any():
@@ -653,11 +656,10 @@ def update_computed_total_columns(df: pd.DataFrame, schema: dict[str, object], b
     if baseline_df is not None:
         out = refresh_day_hour_brackets(out, baseline_df, schema)
     if total_col and total_col in out.columns:
-        if baseline_df is not None:
-            _, new_minutes = calculate_weekly_minutes_contextual(baseline_df, out, day_cols)
-            out[total_col] = new_minutes.apply(minutes_to_hhmm)
-        else:
-            out[total_col] = calculate_weekly_minutes(out, day_cols).apply(minutes_to_hhmm)
+        # Total Planned Working Time her zaman gün hücrelerindeki [] içi
+        # saatlerin toplamıdır. Kullanıcı [08:00h] değerini [09:00h]
+        # yaparsa toplam da doğrudan buna göre güncellenir.
+        out[total_col] = calculate_weekly_minutes(out, day_cols).apply(minutes_to_hhmm)
     if days_off_col and days_off_col in out.columns:
         out[days_off_col] = calculate_days_off(out, day_cols)
     return out
@@ -878,8 +880,8 @@ def render_roster_editor(schema: dict[str, object], hide_employee: bool = False)
     # görsel olarak değiştiremeyebilir; bu tablo kaydedilecek yeni total değerini net gösterir.
     changed_total_preview = compare_weekly_hours(saved_editor_df, computed_edited_df, schema)
     if total_col and total_col in computed_edited_df.columns and not changed_total_preview.empty:
-        _, preview_new_minutes = calculate_weekly_minutes_contextual(saved_editor_df, computed_edited_df, day_cols)
-        preview_old_minutes, _ = calculate_weekly_minutes_contextual(saved_editor_df, saved_editor_df, day_cols)
+        preview_new_minutes = calculate_weekly_minutes(computed_edited_df, day_cols)
+        preview_old_minutes = calculate_weekly_minutes(saved_editor_df, day_cols)
         preview_indices = preview_new_minutes[preview_new_minutes != preview_old_minutes].index.tolist()
         preview_cols = [c for c in [schema.get("employee"), schema.get("first_name"), schema.get("last_name"), total_col, days_off_col] if c and c in computed_edited_df.columns]
         preview_df = computed_edited_df.loc[preview_indices, preview_cols]
