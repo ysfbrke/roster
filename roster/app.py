@@ -748,8 +748,26 @@ def render_service_route_change_panel(records: pd.DataFrame, schema: dict[str, o
             "Grup",
         ]
     ].copy()
+
     edit_df = edit_df.drop_duplicates(subset=["_override_key"]).reset_index(drop=True)
     edit_df["Yeni Servis Kodu"] = edit_df["Servis Kodu"].astype(str)
+
+    name_filter = st.text_input(
+        "Servis kodu değiştirmek için isim ara",
+        placeholder="Örn: Yusuf, Ali, Mehmet",
+        key="service_route_name_filter",
+    )
+
+    if name_filter:
+        edit_df = edit_df[
+            edit_df["Ad Soyad"]
+            .astype(str)
+            .str.contains(name_filter, case=False, na=False, regex=False)
+        ].reset_index(drop=True)
+
+    if edit_df.empty:
+        st.info("Bu isim filtresine uygun personel bulunamadı.")
+        return
 
     visible_cols = [
         "_override_key",
@@ -763,7 +781,9 @@ def render_service_route_change_panel(records: pd.DataFrame, schema: dict[str, o
         "Görev/Uçak Kodu",
         "Grup",
     ]
+
     edit_view = edit_df[visible_cols].copy()
+
     if hide_employee:
         edit_view = edit_view.drop(columns=["Employee Number"], errors="ignore")
 
