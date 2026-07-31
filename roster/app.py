@@ -113,11 +113,13 @@ def set_page_style() -> None:
 def logo_header() -> None:
     logo_path = ASSET_DIR / "celebi_logo.svg"
     col1, col2 = st.columns([1, 7])
+
     with col1:
         if logo_path.exists():
             st.image(str(logo_path), use_container_width=True)
         else:
             st.markdown("### ÇELEBİ")
+
     with col2:
         st.markdown(
             """
@@ -142,6 +144,7 @@ def is_planner_mode() -> bool:
 def render_login_page() -> bool:
     logo_path = ASSET_DIR / "celebi_logo.svg"
     c1, c2 = st.columns([1, 5])
+
     with c1:
         if logo_path.exists():
             st.image(str(logo_path), use_container_width=True)
@@ -165,6 +168,7 @@ def render_login_page() -> bool:
     with admin_col:
         st.markdown("### 🔐 Yönetici Girişi")
         password = st.text_input("Yönetici şifresi", type="password", key="admin_password_input")
+
         if st.button("Yönetici olarak giriş yap", type="primary", use_container_width=True):
             if password == get_admin_password():
                 st.session_state["user_role"] = ROLE_ADMIN
@@ -175,6 +179,7 @@ def render_login_page() -> bool:
     with planner_col:
         st.markdown("### 🧭 Planlamacı Girişi")
         st.caption("Şifre yoktur. Employee Number / Sicil hiçbir ekranda gösterilmez.")
+
         if st.button("Planlamacı olarak giriş yap", use_container_width=True):
             st.session_state["user_role"] = ROLE_PLANNER
             st.rerun()
@@ -185,6 +190,7 @@ def render_login_page() -> bool:
 def require_login() -> bool:
     if st.session_state.get("user_role") in {ROLE_ADMIN, ROLE_PLANNER}:
         return True
+
     return render_login_page()
 
 
@@ -205,6 +211,7 @@ def read_roster_excel(file_obj) -> tuple[pd.DataFrame, str]:
     xls = pd.ExcelFile(file_obj)
 
     preferred = None
+
     for sheet_name in xls.sheet_names:
         if "roster" in sheet_name.lower():
             preferred = sheet_name
@@ -225,6 +232,7 @@ def find_col(df: pd.DataFrame, aliases: Iterable[str], fallback_index: int | Non
 
     for alias in aliases:
         key = alias.strip().lower()
+
         if key in normalized:
             return normalized[key]
 
@@ -281,6 +289,7 @@ def get_schema(df: pd.DataFrame) -> dict[str, object]:
 
     if not day_cols and len(cols) >= 12:
         total_planned_col = schema.get("total_planned")
+
         if total_planned_col and str(total_planned_col) in cols:
             total_index = cols.index(str(total_planned_col))
             day_cols = cols[5:total_index]
@@ -386,6 +395,7 @@ def parse_hours_to_minutes(value: object) -> int:
         if start is not None and end is not None:
             if end < start:
                 end += 24 * 60
+
             return max(end - start, 0)
 
     return 0
@@ -629,7 +639,11 @@ def effective_service_code(original_code: object, override_key: str) -> str:
     return str(original_code or "").strip()
 
 
-def build_shift_records(df: pd.DataFrame, schema: dict[str, object]) -> pd.DataFrame:
+def build_shift_records(
+    df: pd.DataFrame,
+    schema: dict[str, object],
+    apply_overrides: bool = True,
+) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
 
     # Servis planlama 8 gün dahil tüm günleri kullanır.
@@ -684,7 +698,11 @@ def build_shift_records(df: pd.DataFrame, schema: dict[str, object]) -> pd.DataF
                         "Başlangıç": parsed["start"],
                         "Bitiş": parsed.get("end"),
                         "Sıralama Dakika": parsed.get("start_min") or 0,
-                        "Servis Kodu": effective_service_code(original_route, key),
+                        "Servis Kodu": (
+                            effective_service_code(original_route, key)
+                            if apply_overrides
+                            else str(original_route or "").strip()
+                        ),
                     }
                 )
 
@@ -700,7 +718,11 @@ def build_shift_records(df: pd.DataFrame, schema: dict[str, object]) -> pd.DataF
                         "Başlangıç": parsed.get("start"),
                         "Bitiş": parsed["end"],
                         "Sıralama Dakika": parsed.get("end_min") or 0,
-                        "Servis Kodu": effective_service_code(original_route, key),
+                        "Servis Kodu": (
+                            effective_service_code(original_route, key)
+                            if apply_overrides
+                            else str(original_route or "").strip()
+                        ),
                     }
                 )
 
@@ -1167,8 +1189,6 @@ def render_roster_editor(schema: dict[str, object], hide_employee: bool = False)
     st.subheader("✏️ Roster Düzenle")
 
     active_df = st.session_state["active_roster_df"].copy().astype("object")
-    saved_df = st.session_state.get("saved_roster_df", active_df).copy().astype("object")
-
     first_col = schema.get("first_name")
     search_name = ""
 
@@ -1282,6 +1302,132 @@ def render_roster_editor(schema: dict[str, object], hide_employee: bool = False)
         st.rerun()
 
 
+def build_change_summary_sheet(
+    df: pd.DataFrame,
+    records_after: pd.DataFrame,
+    schema: dict[str, object],
+) -> pd.DataFrame:
+    """
+    Export için 'Değişiklik Özeti' sheetini üretir.
+    Sadece Kategorize Plan ekranındaki servis kodu değişikliklerini baz alır.
+    """
+
+    overrides = get_service_route_overrides()
+
+    metrics = {
+        "Toplam servis kodu değişikliği": 0,
+        "Etkilenen personel sayısı": 0,
+        "Etkilenen gün sayısı": 0,
+        "Etkilenen servis güzergahı": 0,
+        "Yeni eklenen servis grubu": 0,
+        "İptal olan servis grubu": 0,
+        "5 kişiye tamamlanan servis": 0,
+        "4 ve altına düşen riskli servis": 0,
+    }
+
+    if not overrides:
+        return pd.DataFrame([{"Metrik": key, "Sayı": value} for key, value in metrics.items()])
+
+    records_before = build_shift_records(df, schema, apply_overrides=False)
+
+    if records_before.empty or records_after.empty:
+        return pd.DataFrame([{"Metrik": key, "Sayı": value} for key, value in metrics.items()])
+
+    changed_after = records_after[
+        records_after["_override_key"].astype(str).isin(overrides.keys())
+    ].copy()
+
+    changed_before = records_before[
+        records_before["_override_key"].astype(str).isin(overrides.keys())
+    ].copy()
+
+    metrics["Toplam servis kodu değişikliği"] = len(overrides)
+
+    if not changed_after.empty:
+        metrics["Etkilenen personel sayısı"] = changed_after["Ad Soyad"].nunique()
+        metrics["Etkilenen gün sayısı"] = changed_after["Gün"].nunique()
+
+        affected_routes = set(changed_after["Servis Kodu"].dropna().astype(str))
+        affected_routes |= set(changed_after["Orijinal Servis Kodu"].dropna().astype(str))
+        metrics["Etkilenen servis güzergahı"] = len([x for x in affected_routes if x.strip()])
+
+    before_counts = (
+        records_before
+        .groupby(["Gün", "Yön", "Saat", "Servis Kodu"], dropna=False)
+        .size()
+        .reset_index(name="Önceki Personel Sayısı")
+    )
+
+    after_counts = (
+        records_after
+        .groupby(["Gün", "Yön", "Saat", "Servis Kodu"], dropna=False)
+        .size()
+        .reset_index(name="Son Personel Sayısı")
+    )
+
+    compare = before_counts.merge(
+        after_counts,
+        on=["Gün", "Yön", "Saat", "Servis Kodu"],
+        how="outer",
+    )
+
+    compare["Önceki Personel Sayısı"] = compare["Önceki Personel Sayısı"].fillna(0).astype(int)
+    compare["Son Personel Sayısı"] = compare["Son Personel Sayısı"].fillna(0).astype(int)
+
+    affected_keys = set()
+
+    for _, row in changed_before.iterrows():
+        affected_keys.add(
+            (
+                str(row.get("Gün", "")),
+                str(row.get("Yön", "")),
+                str(row.get("Saat", "")),
+                str(row.get("Servis Kodu", "")),
+            )
+        )
+
+    for _, row in changed_after.iterrows():
+        affected_keys.add(
+            (
+                str(row.get("Gün", "")),
+                str(row.get("Yön", "")),
+                str(row.get("Saat", "")),
+                str(row.get("Servis Kodu", "")),
+            )
+        )
+
+    if affected_keys:
+        compare["_affected"] = compare.apply(
+            lambda r: (
+                str(r["Gün"]),
+                str(r["Yön"]),
+                str(r["Saat"]),
+                str(r["Servis Kodu"]),
+            )
+            in affected_keys,
+            axis=1,
+        )
+        compare = compare[compare["_affected"]].copy()
+
+    metrics["Yeni eklenen servis grubu"] = int(
+        ((compare["Önceki Personel Sayısı"] == 0) & (compare["Son Personel Sayısı"] > 0)).sum()
+    )
+
+    metrics["İptal olan servis grubu"] = int(
+        ((compare["Önceki Personel Sayısı"] > 0) & (compare["Son Personel Sayısı"] == 0)).sum()
+    )
+
+    metrics["5 kişiye tamamlanan servis"] = int(
+        ((compare["Önceki Personel Sayısı"] <= 4) & (compare["Son Personel Sayısı"] >= 5)).sum()
+    )
+
+    metrics["4 ve altına düşen riskli servis"] = int(
+        ((compare["Önceki Personel Sayısı"] >= 5) & (compare["Son Personel Sayısı"] <= 4)).sum()
+    )
+
+    return pd.DataFrame([{"Metrik": key, "Sayı": value} for key, value in metrics.items()])
+
+
 def build_export_bytes(
     df: pd.DataFrame,
     records: pd.DataFrame,
@@ -1314,8 +1460,11 @@ def build_export_bytes(
         columns=["Metrik", "Değer"],
     )
 
+    change_summary = build_change_summary_sheet(df, records, schema)
+
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         summary.to_excel(writer, index=False, sheet_name="Dashboard")
+        change_summary.to_excel(writer, index=False, sheet_name="Değişiklik Özeti")
         df_export.to_excel(writer, index=False, sheet_name="Düzenlenen Roster")
         records_export.to_excel(writer, index=False, sheet_name="Ham Vardiya Listesi")
         drop_internal_columns(gelis).to_excel(writer, index=False, sheet_name="Kategorize Geliş")
@@ -1330,7 +1479,9 @@ def render_export(df: pd.DataFrame, records: pd.DataFrame, schema: dict[str, obj
     if hide_employee:
         st.markdown("Planlamacı modunda export alınırken Employee Number / Sicil bilgisi gizlenir.")
     else:
-        st.markdown("Roster, ham vardiya listesi, kategorize geliş ve kategorize gidiş sayfalarını tek Excel olarak indirebilirsin.")
+        st.markdown(
+            "Roster, değişiklik özeti, ham vardiya listesi, kategorize geliş ve kategorize gidiş sayfalarını tek Excel olarak indirebilirsin."
+        )
 
     export_bytes = build_export_bytes(df, records, schema, hide_employee=hide_employee)
     file_name = f"celebi_roster_plan_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
@@ -1418,6 +1569,7 @@ def main() -> None:
             3. Roster düzenlemede geçmiş haftanın son günü gösterilmez.
             4. Haftalık çalışma saati sadece yeni haftanın 7 günü üzerinden hesaplanır.
             5. Kategorize Plan ekranında seçilen personelin sadece o gün/saat servis kodunu değiştirebilirsin.
+            6. Export içinde “Değişiklik Özeti” sheet’i otomatik oluşur.
             """
         )
         return
