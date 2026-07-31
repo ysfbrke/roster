@@ -124,7 +124,7 @@ def logo_header() -> None:
             <div class="hero">
                 <div><span class="pill">Roster</span><span class="pill">Servis Planlama</span><span class="pill">Haftalık Saat Kontrolü</span></div>
                 <h1>Çelebi Akıllı Roster Planlama Sistemi</h1>
-                <p>Aynı gün, aynı saat ve aynı servis güzergâhındaki personelleri görev kodlarıyla gruplar.</p>
+                <p>Servis planlama tüm yüklenen günleri okur; haftalık saat hesabı yeni haftanın 7 gününe göre yapılır.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -147,6 +147,7 @@ def render_login_page() -> bool:
             st.image(str(logo_path), use_container_width=True)
         else:
             st.markdown("### ÇELEBİ")
+
     with c2:
         st.markdown(
             """
@@ -160,6 +161,7 @@ def render_login_page() -> bool:
         )
 
     admin_col, planner_col = st.columns(2)
+
     with admin_col:
         st.markdown("### 🔐 Yönetici Girişi")
         password = st.text_input("Yönetici şifresi", type="password", key="admin_password_input")
@@ -189,87 +191,138 @@ def require_login() -> bool:
 def normalize_col_name(col: object) -> str:
     if isinstance(col, datetime):
         return col.strftime("%Y%m%d")
+
     text = str(col).strip()
+
     if text.endswith(".0") and text[:-2].isdigit():
         return text[:-2]
+
     return text
 
 
 def read_roster_excel(file_obj) -> tuple[pd.DataFrame, str]:
     file_obj.seek(0)
     xls = pd.ExcelFile(file_obj)
+
     preferred = None
     for sheet_name in xls.sheet_names:
         if "roster" in sheet_name.lower():
             preferred = sheet_name
             break
+
     sheet_name = preferred or xls.sheet_names[0]
+
     file_obj.seek(0)
     df = pd.read_excel(file_obj, sheet_name=sheet_name, dtype=object)
     df.columns = [normalize_col_name(c) for c in df.columns]
     df = df.dropna(how="all").reset_index(drop=True)
+
     return df, sheet_name
 
 
 def find_col(df: pd.DataFrame, aliases: Iterable[str], fallback_index: int | None = None) -> str | None:
     normalized = {str(c).strip().lower(): str(c) for c in df.columns}
+
     for alias in aliases:
         key = alias.strip().lower()
         if key in normalized:
             return normalized[key]
+
     if fallback_index is not None and fallback_index < len(df.columns):
         return str(df.columns[fallback_index])
+
     return None
 
 
 def parse_date_column(col: object) -> datetime | None:
     text = normalize_col_name(col)
-    m = re.fullmatch(r"(20\d{6})", text)
-    if not m:
+    match = re.fullmatch(r"(20\d{6})", text)
+
+    if not match:
         return None
+
     try:
-        return datetime.strptime(m.group(1), "%Y%m%d")
+        return datetime.strptime(match.group(1), "%Y%m%d")
     except ValueError:
         return None
 
 
 def get_schema(df: pd.DataFrame) -> dict[str, object]:
     cols = [str(c) for c in df.columns]
+
     schema: dict[str, object] = {
         "employee": find_col(df, BASE_COLUMN_ALIASES["employee"], 0),
         "first_name": find_col(df, BASE_COLUMN_ALIASES["first_name"], 1),
         "last_name": find_col(df, BASE_COLUMN_ALIASES["last_name"], 2),
         "district": find_col(df, BASE_COLUMN_ALIASES["district"], 3),
         "group": find_col(df, BASE_COLUMN_ALIASES["group"], 4),
-        "total_planned": find_col(df, BASE_COLUMN_ALIASES["total_planned"], len(cols) - 3 if len(cols) >= 3 else None),
-        "total_target": find_col(df, BASE_COLUMN_ALIASES["total_target"], len(cols) - 2 if len(cols) >= 2 else None),
-        "days_off": find_col(df, BASE_COLUMN_ALIASES["days_off"], len(cols) - 1 if len(cols) >= 1 else None),
+        "total_planned": find_col(
+            df,
+            BASE_COLUMN_ALIASES["total_planned"],
+            len(cols) - 3 if len(cols) >= 3 else None,
+        ),
+        "total_target": find_col(
+            df,
+            BASE_COLUMN_ALIASES["total_target"],
+            len(cols) - 2 if len(cols) >= 2 else None,
+        ),
+        "days_off": find_col(
+            df,
+            BASE_COLUMN_ALIASES["days_off"],
+            len(cols) - 1 if len(cols) >= 1 else None,
+        ),
     }
 
     day_cols: list[str] = []
-    for c in cols:
-        if parse_date_column(c) is not None:
-            day_cols.append(c)
+
+    for col in cols:
+        if parse_date_column(col) is not None:
+            day_cols.append(col)
+
     if not day_cols and len(cols) >= 12:
-        day_cols = cols[5:12]
-    schema["day_cols"] = day_cols[:7]
+        total_planned_col = schema.get("total_planned")
+        if total_planned_col and str(total_planned_col) in cols:
+            total_index = cols.index(str(total_planned_col))
+            day_cols = cols[5:total_index]
+        else:
+            day_cols = cols[5:12]
+
+    # Servis planlama tüm yüklenen günleri kullanır.
+    # Örnek: geçmiş haftanın son günü + yeni haftanın 7 günü = 8 gün.
+    schema["service_day_cols"] = day_cols
+
+    # Roster düzenleme ve haftalık saat hesabı yeni haftanın 7 gününü kullanır.
+    # Eğer 8 veya daha fazla gün varsa ilk gün geçmiş hafta kabul edilir ve hariç tutulur.
+    if len(day_cols) >= 8:
+        schema["day_cols"] = day_cols[1:8]
+        schema["excluded_previous_day_col"] = day_cols[0]
+    else:
+        schema["day_cols"] = day_cols[:7]
+        schema["excluded_previous_day_col"] = None
+
     return schema
 
 
 def day_label(col: str) -> str:
     date_value = parse_date_column(col)
+
     if date_value:
         return f"{DAY_NAMES_TR[date_value.weekday()]} {date_value.strftime('%d.%m.%Y')}"
+
     return str(col)
 
 
 def is_off_or_empty(value: object) -> bool:
     if value is None or pd.isna(value):
         return True
+
     text = str(value).strip()
+
     if text in {"", "-"}:
         return True
+
     upper = text.upper()
+
     return upper.startswith("DO") or upper in {"OFF", "REST", "İZİN", "IZIN"}
 
 
@@ -281,6 +334,7 @@ def raw_time_to_hhmm(raw: str) -> str:
 def time_to_minutes(hhmm: str | None) -> int | None:
     if not hhmm:
         return None
+
     try:
         hour, minute = hhmm.split(":")
         return int(hour) * 60 + int(minute)
@@ -291,31 +345,44 @@ def time_to_minutes(hhmm: str | None) -> int | None:
 def minutes_to_hhmm(minutes: int | float | None) -> str:
     if minutes is None or pd.isna(minutes):
         minutes = 0
+
     minutes_int = int(round(float(minutes)))
     sign = "-" if minutes_int < 0 else ""
+
     minutes_int = abs(minutes_int)
+
     return f"{sign}{minutes_int // 60:02d}:{minutes_int % 60:02d} h"
 
 
 def parse_hours_to_minutes(value: object) -> int:
     if value is None or pd.isna(value):
         return 0
+
     text = str(value).strip()
+
     if not text:
         return 0
 
-    bracket_match = re.search(r"\[\s*(\d{1,3})\s*:\s*(\d{1,2})\s*h?\s*\]", text, flags=re.IGNORECASE)
+    bracket_match = re.search(
+        r"\[\s*(\d{1,3})\s*:\s*(\d{1,2})\s*h?\s*\]",
+        text,
+        flags=re.IGNORECASE,
+    )
+
     if bracket_match:
         return int(bracket_match.group(1)) * 60 + int(bracket_match.group(2))
 
     decimal_match = re.search(r"(\d+(?:[\.,]\d+)?)\s*h", text, flags=re.IGNORECASE)
+
     if decimal_match:
         return int(round(float(decimal_match.group(1).replace(",", ".")) * 60))
 
     time_match = re.search(r"(\d{3,4})\s*-\s*(\d{3,4})", text)
+
     if time_match:
         start = time_to_minutes(raw_time_to_hhmm(time_match.group(1)))
         end = time_to_minutes(raw_time_to_hhmm(time_match.group(2)))
+
         if start is not None and end is not None:
             if end < start:
                 end += 24 * 60
@@ -327,26 +394,36 @@ def parse_hours_to_minutes(value: object) -> int:
 def extract_shift_range(value: object) -> tuple[str | None, str | None, int | None]:
     if value is None or pd.isna(value):
         return None, None, None
+
     text = str(value).strip()
-    m = re.search(r"(\d{3,4})\s*-\s*(\d{3,4})", text)
-    if not m:
+    match = re.search(r"(\d{3,4})\s*-\s*(\d{3,4})", text)
+
+    if not match:
         return None, None, None
-    start = raw_time_to_hhmm(m.group(1))
-    end = raw_time_to_hhmm(m.group(2))
+
+    start = raw_time_to_hhmm(match.group(1))
+    end = raw_time_to_hhmm(match.group(2))
+
     start_min = time_to_minutes(start)
     end_min = time_to_minutes(end)
+
     if start_min is None or end_min is None:
         return start, end, None
+
     if end_min < start_min:
         end_min += 24 * 60
+
     return start, end, end_min - start_min
 
 
 def paid_minutes_from_cell(value: object) -> int:
     bracket_minutes = parse_hours_to_minutes(value)
+
     if bracket_minutes:
         return bracket_minutes
+
     _, _, elapsed = extract_shift_range(value)
+
     return int(elapsed or 0)
 
 
@@ -356,6 +433,7 @@ def contextual_paid_minutes(old_value: object, new_value: object) -> int:
 
     old_paid = paid_minutes_from_cell(old_value)
     new_paid = paid_minutes_from_cell(new_value)
+
     old_start, old_end, old_elapsed = extract_shift_range(old_value)
     new_start, new_end, new_elapsed = extract_shift_range(new_value)
 
@@ -364,6 +442,7 @@ def contextual_paid_minutes(old_value: object, new_value: object) -> int:
 
     old_bracket = parse_hours_to_minutes(old_value)
     new_bracket = parse_hours_to_minutes(new_value)
+
     range_changed = (old_start, old_end) != (new_start, new_end)
     bracket_same = old_bracket == new_bracket
 
@@ -374,25 +453,39 @@ def contextual_paid_minutes(old_value: object, new_value: object) -> int:
     return new_paid
 
 
-def refresh_day_hour_brackets(edited_df: pd.DataFrame, baseline_df: pd.DataFrame, schema: dict[str, object]) -> pd.DataFrame:
+def refresh_day_hour_brackets(
+    edited_df: pd.DataFrame,
+    baseline_df: pd.DataFrame,
+    schema: dict[str, object],
+) -> pd.DataFrame:
     out = edited_df.copy().astype("object")
     day_cols: list[str] = list(schema.get("day_cols", []))
 
     for col in day_cols:
         if col not in out.columns:
             continue
+
         for idx in out.index:
             old_value = baseline_df.loc[idx, col] if col in baseline_df.columns and idx in baseline_df.index else ""
             new_value = out.loc[idx, col]
             new_text = "" if pd.isna(new_value) else str(new_value).strip()
+
             if not new_text or extract_shift_range(new_text)[2] is None:
                 continue
+
             minutes = contextual_paid_minutes(old_value, new_value)
             hour_text = f"{minutes // 60:02d}:{minutes % 60:02d}h"
+
             if re.search(r"\[\s*\d{1,3}\s*:\s*\d{2}\s*h\s*\]", new_text, flags=re.IGNORECASE):
-                new_text = re.sub(r"\[\s*\d{1,3}\s*:\s*\d{2}\s*h\s*\]", f"[{hour_text} ]", new_text, flags=re.IGNORECASE)
+                new_text = re.sub(
+                    r"\[\s*\d{1,3}\s*:\s*\d{2}\s*h\s*\]",
+                    f"[{hour_text} ]",
+                    new_text,
+                    flags=re.IGNORECASE,
+                )
             else:
                 new_text = f"{new_text} [{hour_text} ]"
+
             out.loc[idx, col] = new_text
 
     return out
@@ -401,20 +494,26 @@ def refresh_day_hour_brackets(edited_df: pd.DataFrame, baseline_df: pd.DataFrame
 def calculate_weekly_minutes(df: pd.DataFrame, day_cols: list[str]) -> pd.Series:
     if df.empty:
         return pd.Series(dtype="int64")
+
     total = pd.Series(0, index=df.index, dtype="int64")
+
     for col in day_cols:
         if col in df.columns:
             total += df[col].apply(parse_hours_to_minutes).astype("int64")
+
     return total
 
 
 def calculate_days_off(df: pd.DataFrame, day_cols: list[str]) -> pd.Series:
     if df.empty:
         return pd.Series(dtype="int64")
+
     total = pd.Series(0, index=df.index, dtype="int64")
+
     for col in day_cols:
         if col in df.columns:
             total += df[col].apply(lambda v: 1 if is_off_or_empty(v) else 0).astype("int64")
+
     return total
 
 
@@ -424,6 +523,7 @@ def update_computed_total_columns(
     baseline_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     out = df.copy().astype("object")
+
     day_cols: list[str] = list(schema.get("day_cols", []))
     total_col = schema.get("total_planned")
     days_off_col = schema.get("days_off")
@@ -442,6 +542,7 @@ def update_computed_total_columns(
 
 def parse_shift_cell(value: object) -> dict[str, object]:
     text = "" if value is None or pd.isna(value) else str(value).strip()
+
     result: dict[str, object] = {
         "raw": text,
         "is_off": is_off_or_empty(value),
@@ -457,9 +558,11 @@ def parse_shift_cell(value: object) -> dict[str, object]:
         return result
 
     time_match = re.search(r"(\d{3,4})\s*-\s*(\d{3,4})", text)
+
     if time_match:
         start = raw_time_to_hhmm(time_match.group(1))
         end = raw_time_to_hhmm(time_match.group(2))
+
         result.update(
             {
                 "start": start,
@@ -470,12 +573,15 @@ def parse_shift_cell(value: object) -> dict[str, object]:
         )
 
     task_match = re.search(r"\d{3,4}\s*-\s*\d{3,4}\s*\(([^)]+)\)", text)
+
     if task_match:
         result["task"] = task_match.group(1).strip()
     else:
         code_match = re.match(r"^([A-ZÇĞİÖŞÜ0-9_./-]+)\s*\[", text.upper())
+
         if code_match:
             candidate = code_match.group(1).strip()
+
             if not re.fullmatch(r"\d{3,4}-\d{3,4}", candidate):
                 result["task"] = candidate
 
@@ -485,22 +591,28 @@ def parse_shift_cell(value: object) -> dict[str, object]:
 def full_name(row: pd.Series, schema: dict[str, object]) -> str:
     first_col = schema.get("first_name")
     last_col = schema.get("last_name")
+
     first = str(row.get(first_col, "") if first_col else "").strip()
     last = str(row.get(last_col, "") if last_col else "").strip()
+
     return f"{first} {last}".strip()
 
 
 def task_or_group(task: str, group_value: object) -> str:
     task_text = str(task or "").strip()
+
     if task_text and not re.fullmatch(r"\d{3,4}-\d{3,4}", task_text):
         return task_text
+
     group_text = str(group_value or "").strip()
+
     return group_text or "-"
 
 
 def get_service_route_overrides() -> dict[str, str]:
     if "service_route_overrides" not in st.session_state:
         st.session_state["service_route_overrides"] = {}
+
     return st.session_state["service_route_overrides"]
 
 
@@ -510,14 +622,19 @@ def make_service_override_key(row_id: int, day_col: str, direction: str, time_te
 
 def effective_service_code(original_code: object, override_key: str) -> str:
     overrides = get_service_route_overrides()
+
     if override_key in overrides:
         return str(overrides[override_key]).strip()
+
     return str(original_code or "").strip()
 
 
 def build_shift_records(df: pd.DataFrame, schema: dict[str, object]) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
-    day_cols: list[str] = list(schema.get("day_cols", []))
+
+    # Servis planlama 8 gün dahil tüm günleri kullanır.
+    day_cols: list[str] = list(schema.get("service_day_cols", schema.get("day_cols", [])))
+
     emp_col = schema.get("employee")
     district_col = schema.get("district")
     group_col = schema.get("group")
@@ -530,12 +647,15 @@ def build_shift_records(df: pd.DataFrame, schema: dict[str, object]) -> pd.DataF
 
         for day_order, day_col in enumerate(day_cols):
             parsed = parse_shift_cell(row.get(day_col, ""))
+
             if parsed["is_off"]:
                 continue
+
             if not parsed.get("start") and not parsed.get("end"):
                 continue
 
             task_value = task_or_group(str(parsed.get("task", "")), group)
+
             common = {
                 "_row_id": row_index,
                 "Employee Number": emp,
@@ -554,6 +674,7 @@ def build_shift_records(df: pd.DataFrame, schema: dict[str, object]) -> pd.DataF
 
             if parsed.get("start"):
                 key = make_service_override_key(row_index, str(day_col), "Geliş", str(parsed["start"]))
+
                 rows.append(
                     {
                         **common,
@@ -569,6 +690,7 @@ def build_shift_records(df: pd.DataFrame, schema: dict[str, object]) -> pd.DataF
 
             if parsed.get("end"):
                 key = make_service_override_key(row_index, str(day_col), "Gidiş", str(parsed["end"]))
+
                 rows.append(
                     {
                         **common,
@@ -583,63 +705,78 @@ def build_shift_records(df: pd.DataFrame, schema: dict[str, object]) -> pd.DataF
                 )
 
     records = pd.DataFrame(rows)
+
     if not records.empty:
         records = records.sort_values(
             ["Gün Sütunu", "Sıralama Dakika", "Servis Kodu", "Ad Soyad"],
             kind="stable",
         ).reset_index(drop=True)
+
     return records
 
 
 def remove_employee_number_columns(df: pd.DataFrame, schema: dict[str, object] | None = None) -> pd.DataFrame:
     out = df.copy()
     possible = {"Employee Number", "Sicil", "Sicil No", "Sicil Numarası"}
+
     if schema and schema.get("employee"):
         possible.add(str(schema["employee"]))
 
     for col in list(out.columns):
         if str(col) in possible or str(col).strip().lower() in {"employee number", "sicil"}:
             out = out.drop(columns=[col])
+
     return out
 
 
 def drop_internal_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+
     for col in list(out.columns):
         if str(col).startswith("_") or str(col) in {"Gün Sütunu", "Sıralama Dakika", "Gün Kolonu"}:
             out = out.drop(columns=[col])
+
     return out
 
 
 def display_df(df: pd.DataFrame, schema: dict[str, object], hide_employee: bool = False, **kwargs) -> None:
     view = remove_employee_number_columns(df, schema) if hide_employee else df.copy()
     view = drop_internal_columns(view)
+
     st.dataframe(view, use_container_width=True, hide_index=True, **kwargs)
 
 
 def add_column_filters(df: pd.DataFrame, key_prefix: str, default_columns: list[str] | None = None) -> pd.DataFrame:
     if df.empty:
         return df
+
     with st.expander("🔎 Her sütuna göre filtrele", expanded=False):
         cols = list(df.columns)
+
         selected_cols = st.multiselect(
             "Filtre uygulanacak sütunlar",
             options=cols,
             default=[c for c in (default_columns or []) if c in cols],
             key=f"{key_prefix}_filter_cols",
         )
+
         filtered = df.copy()
+
         for col in selected_cols:
             series = filtered[col].fillna("").astype(str)
             unique_values = sorted([x for x in series.unique().tolist() if x != ""])
+
             if 0 < len(unique_values) <= 80:
                 chosen = st.multiselect(col, unique_values, key=f"{key_prefix}_{col}_multi")
+
                 if chosen:
                     filtered = filtered[series.isin(chosen)]
             else:
                 text = st.text_input(f"{col} içinde ara", key=f"{key_prefix}_{col}_text")
+
                 if text:
                     filtered = filtered[series.str.contains(text, case=False, na=False, regex=False)]
+
         return filtered
 
 
@@ -660,8 +797,10 @@ def build_route_summary(records: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
         .sort_values(["Gün Sütunu", "Sıralama Dakika", "Yön", "Servis Kodu"], kind="stable")
     )
+
     grouped["Durum"] = grouped["Personel_Sayısı"].apply(lambda x: "⚠️ 4 ve altı" if int(x) <= 4 else "✅ Uygun")
     grouped = grouped.rename(columns={"Personel_Sayısı": "Personel Sayısı"})
+
     return grouped
 
 
@@ -670,10 +809,12 @@ def build_transport_table(records: pd.DataFrame, direction: str) -> pd.DataFrame
         return pd.DataFrame()
 
     temp = records[records["Yön"] == direction].copy()
+
     if temp.empty:
         return pd.DataFrame()
 
     temp = temp.sort_values(["Gün Sütunu", "Sıralama Dakika", "Servis Kodu", "Ad Soyad"], kind="stable")
+
     rows: list[dict[str, object]] = []
 
     for (day_order, day, minute, hour, route), group in temp.groupby(
@@ -681,6 +822,7 @@ def build_transport_table(records: pd.DataFrame, direction: str) -> pd.DataFrame
         sort=False,
     ):
         count = len(group)
+
         rows.append(
             {
                 "Satır Tipi": "Başlık",
@@ -695,6 +837,7 @@ def build_transport_table(records: pd.DataFrame, direction: str) -> pd.DataFrame
                 "Vardiya Hücresi": "",
             }
         )
+
         for _, person in group.iterrows():
             rows.append(
                 {
@@ -717,7 +860,10 @@ def build_transport_table(records: pd.DataFrame, direction: str) -> pd.DataFrame
 
 def render_service_route_change_panel(records: pd.DataFrame, schema: dict[str, object], hide_employee: bool = False) -> None:
     st.markdown("#### 🔁 Servis Kodu Değiştir")
-    st.caption("Bu işlem sadece seçilen personelin o gün + o saat + geliş/gidiş kaydını değiştirir. Diğer günleri veya diğer saatleri etkilemez.")
+    st.caption(
+        "Bu işlem sadece seçilen personelin o gün + o saat + geliş/gidiş kaydını değiştirir. "
+        "Diğer günleri veya diğer saatleri etkilemez."
+    )
 
     if records.empty:
         st.info("Servis kodu değiştirilecek aktif kayıt bulunamadı.")
@@ -812,10 +958,12 @@ def render_service_route_change_panel(records: pd.DataFrame, schema: dict[str, o
         for _, row in edited.iterrows():
             key = str(row.get("_override_key", "")).strip()
             new_code = str(row.get("Yeni Servis Kodu", "")).strip()
+
             if not key or not new_code:
                 continue
 
             original_match = edit_df[edit_df["_override_key"].astype(str) == key]
+
             if original_match.empty:
                 continue
 
@@ -841,6 +989,7 @@ def render_service_route_change_panel(records: pd.DataFrame, schema: dict[str, o
 
 def render_dashboard(df: pd.DataFrame, records: pd.DataFrame, schema: dict[str, object], hide_employee: bool = False) -> None:
     st.subheader("📊 Haftalık Özet")
+
     day_cols: list[str] = list(schema.get("day_cols", []))
     total_minutes = int(calculate_weekly_minutes(df, day_cols).sum()) if not df.empty else 0
 
@@ -855,12 +1004,14 @@ def render_dashboard(df: pd.DataFrame, records: pd.DataFrame, schema: dict[str, 
         return
 
     left, right = st.columns([1.3, 1])
+
     with left:
         st.markdown("#### Saat + Servis Bazlı Yoğunluk")
         summary = build_route_summary(records)
         summary = drop_internal_columns(summary)
         summary = add_column_filters(summary, "dashboard_summary", ["Gün", "Servis Kodu"])
         display_df(summary, schema, hide_employee=hide_employee, height=420)
+
     with right:
         st.markdown("#### Görev/Uçak Kodu Dağılımı")
         task_summary = (
@@ -880,31 +1031,43 @@ def render_plan(records: pd.DataFrame, schema: dict[str, object], hide_employee:
         return
 
     c1, c2, c3, c4 = st.columns(4)
+
     with c1:
-        days = sorted(records["Gün"].dropna().unique().tolist(), key=lambda x: records.loc[records["Gün"] == x, "Gün Sütunu"].iloc[0])
+        days = sorted(
+            records["Gün"].dropna().unique().tolist(),
+            key=lambda x: records.loc[records["Gün"] == x, "Gün Sütunu"].iloc[0],
+        )
         selected_days = st.multiselect("Gün", days, default=days, key="plan_days")
+
     with c2:
         routes = sorted(records["Servis Kodu"].dropna().astype(str).unique().tolist())
         selected_routes = st.multiselect("Servis Kodu", routes, default=[], key="plan_routes")
+
     with c3:
         tasks = sorted(records["Görev/Uçak Kodu"].dropna().astype(str).unique().tolist())
         selected_tasks = st.multiselect("Görev/Uçak Kodu", tasks, default=[], key="plan_tasks")
+
     with c4:
         direction = st.selectbox("Liste Tipi", ["Geliş", "Gidiş", "İkisi"], key="plan_direction")
 
     filtered = records.copy()
+
     if selected_days:
         filtered = filtered[filtered["Gün"].isin(selected_days)]
+
     if selected_routes:
         filtered = filtered[filtered["Servis Kodu"].astype(str).isin(selected_routes)]
+
     if selected_tasks:
         filtered = filtered[filtered["Görev/Uçak Kodu"].astype(str).isin(selected_tasks)]
+
     if direction != "İkisi":
         filtered_for_change = filtered[filtered["Yön"] == direction].copy()
     else:
         filtered_for_change = filtered.copy()
 
     st.markdown("#### Detaylı Liste")
+
     detail_cols = [
         "Employee Number",
         "Ad Soyad",
@@ -918,6 +1081,7 @@ def render_plan(records: pd.DataFrame, schema: dict[str, object], hide_employee:
         "Vardiya Hücresi",
         "Grup",
     ]
+
     detail_view = filtered[[c for c in detail_cols if c in filtered.columns]].copy()
     detail_view = add_column_filters(detail_view, "plan_detail", ["Gün", "Servis Kodu", "Görev/Uçak Kodu"])
     display_df(detail_view, schema, hide_employee=hide_employee, height=330)
@@ -925,9 +1089,12 @@ def render_plan(records: pd.DataFrame, schema: dict[str, object], hide_employee:
     render_service_route_change_panel(filtered_for_change, schema, hide_employee=hide_employee)
 
     st.markdown("#### Haftalık Servis Planlaması")
+
     tabs = []
+
     if direction in ["Geliş", "İkisi"]:
         tabs.append("Geliş")
+
     if direction in ["Gidiş", "İkisi"]:
         tabs.append("Gidiş")
 
@@ -937,10 +1104,12 @@ def render_plan(records: pd.DataFrame, schema: dict[str, object], hide_employee:
         display_df(table, schema, hide_employee=hide_employee, height=520)
     else:
         tab_gelis, tab_gidis = st.tabs(["✈️ Geliş", "🏠 Gidiş"])
+
         with tab_gelis:
             table = build_transport_table(filtered, "Geliş")
             table = add_column_filters(table, "transport_gelis", ["Gün", "Saat", "Servis Kodu"])
             display_df(table, schema, hide_employee=hide_employee, height=520)
+
         with tab_gidis:
             table = build_transport_table(filtered, "Gidiş")
             table = add_column_filters(table, "transport_gidis", ["Gün", "Saat", "Servis Kodu"])
@@ -949,20 +1118,26 @@ def render_plan(records: pd.DataFrame, schema: dict[str, object], hide_employee:
 
 def changed_day_names(old_df: pd.DataFrame, new_df: pd.DataFrame, schema: dict[str, object], idx: int) -> str:
     names = []
+
     for col in list(schema.get("day_cols", [])):
         if col not in old_df.columns or col not in new_df.columns:
             continue
+
         old_val = "" if pd.isna(old_df.loc[idx, col]) else str(old_df.loc[idx, col])
         new_val = "" if pd.isna(new_df.loc[idx, col]) else str(new_df.loc[idx, col])
+
         if old_val != new_val:
             names.append(day_label(str(col)))
+
     return ", ".join(names) if names else "-"
 
 
 def compare_weekly_hours(saved_df: pd.DataFrame, edited_df: pd.DataFrame, schema: dict[str, object]) -> pd.DataFrame:
     day_cols: list[str] = list(schema.get("day_cols", []))
+
     old_minutes = calculate_weekly_minutes(saved_df, day_cols)
     new_minutes = calculate_weekly_minutes(edited_df, day_cols)
+
     diff = new_minutes - old_minutes
     changed = diff[diff != 0]
 
@@ -970,7 +1145,9 @@ def compare_weekly_hours(saved_df: pd.DataFrame, edited_df: pd.DataFrame, schema
         return pd.DataFrame()
 
     emp_col = schema.get("employee")
+
     rows = []
+
     for idx, value in changed.items():
         rows.append(
             {
@@ -982,6 +1159,7 @@ def compare_weekly_hours(saved_df: pd.DataFrame, edited_df: pd.DataFrame, schema
                 "Fark": minutes_to_hhmm(value),
             }
         )
+
     return pd.DataFrame(rows)
 
 
@@ -993,18 +1171,31 @@ def render_roster_editor(schema: dict[str, object], hide_employee: bool = False)
 
     first_col = schema.get("first_name")
     search_name = ""
+
     if first_col and first_col in active_df.columns:
         search_name = st.text_input("First Name / İsim ile ara", placeholder="Örn: Ali, Mehmet, Yusuf")
 
     editor_df = active_df.copy().astype("object")
     editor_df["_row_id"] = editor_df.index
 
+    # Eğer dosyada 8 gün varsa ilk gün geçmiş hafta kabul edilir.
+    # Bu sütun roster düzenlemede gösterilmez ve haftalık saat hesabına girmez.
+    excluded_previous_day_col = schema.get("excluded_previous_day_col")
+
+    if excluded_previous_day_col and excluded_previous_day_col in editor_df.columns:
+        editor_df = editor_df.drop(columns=[excluded_previous_day_col])
+
     if search_name and first_col and first_col in editor_df.columns:
-        editor_df = editor_df[editor_df[first_col].astype(str).str.contains(search_name, case=False, na=False)]
+        editor_df = editor_df[
+            editor_df[first_col]
+            .astype(str)
+            .str.contains(search_name, case=False, na=False)
+        ]
 
     visible_editor_df = remove_employee_number_columns(editor_df, schema) if hide_employee else editor_df.copy()
 
     disabled_cols = []
+
     for col in [schema.get("total_planned"), schema.get("days_off")]:
         if col and col in visible_editor_df.columns:
             disabled_cols.append(col)
@@ -1024,8 +1215,10 @@ def render_roster_editor(schema: dict[str, object], hide_employee: bool = False)
 
     if hide_employee:
         emp_col = schema.get("employee")
+
         if emp_col and emp_col in active_df.columns and emp_col not in edited_df.columns:
             edited_df[emp_col] = edited_df["_row_id"].apply(lambda rid: active_df.loc[int(rid), emp_col])
+
         ordered = [c for c in list(active_df.columns) + ["_row_id"] if c in edited_df.columns]
         edited_df = edited_df[ordered]
 
@@ -1033,8 +1226,18 @@ def render_roster_editor(schema: dict[str, object], hide_employee: bool = False)
     baseline_subset = active_df.loc[row_ids].copy().astype("object")
     baseline_subset.index = edited_df.index
 
-    computed_edited_df = update_computed_total_columns(edited_df, schema, baseline_df=baseline_subset)
-    diff_df = compare_weekly_hours(baseline_subset, computed_edited_df, schema)
+    if excluded_previous_day_col and excluded_previous_day_col in baseline_subset.columns:
+        baseline_subset_for_editor = baseline_subset.drop(columns=[excluded_previous_day_col])
+    else:
+        baseline_subset_for_editor = baseline_subset
+
+    computed_edited_df = update_computed_total_columns(
+        edited_df,
+        schema,
+        baseline_df=baseline_subset_for_editor,
+    )
+
+    diff_df = compare_weekly_hours(baseline_subset_for_editor, computed_edited_df, schema)
 
     if not diff_df.empty:
         st.markdown(
@@ -1047,8 +1250,14 @@ def render_roster_editor(schema: dict[str, object], hide_employee: bool = False)
         )
         display_df(diff_df, schema, hide_employee=hide_employee)
 
-    preview_cols = [schema.get("first_name"), schema.get("last_name"), schema.get("total_planned"), schema.get("days_off")]
+    preview_cols = [
+        schema.get("first_name"),
+        schema.get("last_name"),
+        schema.get("total_planned"),
+        schema.get("days_off"),
+    ]
     preview_cols = [c for c in preview_cols if c and c in computed_edited_df.columns]
+
     if preview_cols:
         st.markdown("#### Otomatik Hesaplanan Toplamlar")
         st.dataframe(computed_edited_df[preview_cols], use_container_width=True, hide_index=True)
@@ -1059,18 +1268,26 @@ def render_roster_editor(schema: dict[str, object], hide_employee: bool = False)
 
         for _, row in computed_edited_df.iterrows():
             row_id = int(row["_row_id"])
+
             for col in save_cols:
                 value = row[col]
                 new_active_df.at[row_id, col] = "" if pd.isna(value) else value
 
         new_active_df = update_computed_total_columns(new_active_df, schema)
+
         st.session_state["active_roster_df"] = new_active_df.copy().astype("object")
         st.session_state["saved_roster_df"] = new_active_df.copy().astype("object")
+
         st.success("Roster değişiklikleri kaydedildi.")
         st.rerun()
 
 
-def build_export_bytes(df: pd.DataFrame, records: pd.DataFrame, schema: dict[str, object], hide_employee: bool = False) -> bytes:
+def build_export_bytes(
+    df: pd.DataFrame,
+    records: pd.DataFrame,
+    schema: dict[str, object],
+    hide_employee: bool = False,
+) -> bytes:
     buffer = io.BytesIO()
 
     df_export = remove_employee_number_columns(df, schema) if hide_employee else df.copy()
@@ -1079,6 +1296,7 @@ def build_export_bytes(df: pd.DataFrame, records: pd.DataFrame, schema: dict[str
 
     gelis = build_transport_table(records, "Geliş") if not records.empty else pd.DataFrame()
     gidis = build_transport_table(records, "Gidiş") if not records.empty else pd.DataFrame()
+
     if hide_employee:
         gelis = remove_employee_number_columns(gelis, schema)
         gidis = remove_employee_number_columns(gidis, schema)
@@ -1087,7 +1305,10 @@ def build_export_bytes(df: pd.DataFrame, records: pd.DataFrame, schema: dict[str
         [
             ["Toplam Personel", len(df)],
             ["Aktif Vardiya Kaydı", len(records)],
-            ["Toplam Planlanan Saat", minutes_to_hhmm(calculate_weekly_minutes(df, list(schema.get("day_cols", []))).sum())],
+            [
+                "Toplam Planlanan Saat",
+                minutes_to_hhmm(calculate_weekly_minutes(df, list(schema.get("day_cols", []))).sum()),
+            ],
             ["Servis Lokasyonu", records["Servis Kodu"].nunique() if not records.empty else 0],
         ],
         columns=["Metrik", "Değer"],
@@ -1105,6 +1326,7 @@ def build_export_bytes(df: pd.DataFrame, records: pd.DataFrame, schema: dict[str
 
 def render_export(df: pd.DataFrame, records: pd.DataFrame, schema: dict[str, object], hide_employee: bool = False) -> None:
     st.subheader("⬇️ Excel Dışa Aktar")
+
     if hide_employee:
         st.markdown("Planlamacı modunda export alınırken Employee Number / Sicil bilgisi gizlenir.")
     else:
@@ -1125,6 +1347,7 @@ def render_export(df: pd.DataFrame, records: pd.DataFrame, schema: dict[str, obj
 def initialize_from_upload(uploaded_file) -> bool:
     file_bytes = uploaded_file.getvalue()
     file_hash = hash(file_bytes)
+
     if st.session_state.get("uploaded_hash") == file_hash:
         return True
 
@@ -1135,8 +1358,9 @@ def initialize_from_upload(uploaded_file) -> bool:
         return False
 
     schema = get_schema(df)
+
     if not schema.get("day_cols"):
-        st.error("Gün/vardiya sütunları bulunamadı. Rosterda 6. sütundan itibaren 7 günlük vardiya sütunu olmalı.")
+        st.error("Gün/vardiya sütunları bulunamadı. Rosterda 6. sütundan itibaren vardiya sütunları olmalı.")
         return False
 
     df = df.copy().astype("object")
@@ -1148,15 +1372,18 @@ def initialize_from_upload(uploaded_file) -> bool:
     st.session_state["saved_roster_df"] = df.copy()
     st.session_state["schema"] = schema
     st.session_state["service_route_overrides"] = {}
+
     return True
 
 
 def sidebar_upload() -> bool:
     st.sidebar.markdown("## Dosya")
     uploaded_file = st.sidebar.file_uploader("Haftalık roster Excel dosyasını yükle", type=["xlsx"])
+
     if uploaded_file is None:
         st.sidebar.info("Roster dosyasını yüklediğinde sistem otomatik çalışır.")
         return False
+
     return initialize_from_upload(uploaded_file)
 
 
@@ -1167,9 +1394,11 @@ def main() -> None:
         return
 
     logo_header()
+
     hide_employee = is_planner_mode()
 
     st.sidebar.markdown(f"### Giriş: {current_role_label()}")
+
     if hide_employee:
         st.sidebar.caption("Planlamacı modunda Employee Number / Sicil gizlidir.")
 
@@ -1185,10 +1414,10 @@ def main() -> None:
             Sistem şu mantıkla çalışır:
 
             1. İlk 5 sütundan personel, servis ve grup bilgilerini alır.
-            2. 6. sütundan itibaren Pazartesi–Pazar vardiya hücrelerini okur.
-            3. Aynı gün + aynı saat + aynı servis kodundaki personeli gruplar.
-            4. Kategorize Plan ekranında seçilen personelin sadece o gün/saat servis kodunu değiştirebilirsin.
-            5. Roster düzenlemede [] içindeki saatlere göre toplam çalışma saatini hesaplar.
+            2. Eğer rosterda 8 gün varsa servis planlama 8 günü de okur.
+            3. Roster düzenlemede geçmiş haftanın son günü gösterilmez.
+            4. Haftalık çalışma saati sadece yeni haftanın 7 günü üzerinden hesaplanır.
+            5. Kategorize Plan ekranında seçilen personelin sadece o gün/saat servis kodunu değiştirebilirsin.
             """
         )
         return
@@ -1201,6 +1430,10 @@ def main() -> None:
     st.sidebar.markdown(f"**Okunan sayfa:** `{st.session_state.get('sheet_name', '-')}`")
     st.sidebar.markdown(f"**Personel satırı:** `{len(df)}`")
     st.sidebar.markdown(f"**Aktif vardiya kaydı:** `{len(records)}`")
+
+    if schema.get("excluded_previous_day_col"):
+        st.sidebar.markdown(f"**Haftalık saat dışı gün:** `{day_label(str(schema.get('excluded_previous_day_col')))} `")
+
     st.sidebar.markdown("---")
 
     page = st.sidebar.radio(
