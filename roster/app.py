@@ -296,12 +296,8 @@ def get_schema(df: pd.DataFrame) -> dict[str, object]:
         else:
             day_cols = cols[5:12]
 
-    # Servis planlama tüm yüklenen günleri kullanır.
-    # Örnek: geçmiş haftanın son günü + yeni haftanın 7 günü = 8 gün.
     schema["service_day_cols"] = day_cols
 
-    # Roster düzenleme ve haftalık saat hesabı yeni haftanın 7 gününü kullanır.
-    # Eğer 8 veya daha fazla gün varsa ilk gün geçmiş hafta kabul edilir ve hariç tutulur.
     if len(day_cols) >= 8:
         schema["day_cols"] = day_cols[1:8]
         schema["excluded_previous_day_col"] = day_cols[0]
@@ -630,6 +626,10 @@ def make_service_override_key(row_id: int, day_col: str, direction: str, time_te
     return f"{int(row_id)}||{day_col}||{direction}||{time_text}"
 
 
+def make_person_day_direction_key(row_id: int, day_col: str, direction: str) -> str:
+    return f"{int(row_id)}||{day_col}||{direction}"
+
+
 def effective_service_code(original_code: object, override_key: str) -> str:
     overrides = get_service_route_overrides()
 
@@ -646,7 +646,6 @@ def build_shift_records(
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
 
-    # Servis planlama 8 gün dahil tüm günleri kullanır.
     day_cols: list[str] = list(schema.get("service_day_cols", schema.get("day_cols", [])))
 
     emp_col = schema.get("employee")
@@ -693,6 +692,7 @@ def build_shift_records(
                     {
                         **common,
                         "_override_key": key,
+                        "_person_day_direction_key": make_person_day_direction_key(row_index, str(day_col), "Geliş"),
                         "Yön": "Geliş",
                         "Saat": parsed["start"],
                         "Başlangıç": parsed["start"],
@@ -713,6 +713,7 @@ def build_shift_records(
                     {
                         **common,
                         "_override_key": key,
+                        "_person_day_direction_key": make_person_day_direction_key(row_index, str(day_col), "Gidiş"),
                         "Yön": "Gidiş",
                         "Saat": parsed["end"],
                         "Başlangıç": parsed.get("start"),
@@ -1198,8 +1199,6 @@ def render_roster_editor(schema: dict[str, object], hide_employee: bool = False)
     editor_df = active_df.copy().astype("object")
     editor_df["_row_id"] = editor_df.index
 
-    # Eğer dosyada 8 gün varsa ilk gün geçmiş hafta kabul edilir.
-    # Bu sütun roster düzenlemede gösterilmez ve haftalık saat hesabına girmez.
     excluded_previous_day_col = schema.get("excluded_previous_day_col")
 
     if excluded_previous_day_col and excluded_previous_day_col in editor_df.columns:
@@ -1302,6 +1301,69 @@ def render_roster_editor(schema: dict[str, object], hide_employee: bool = False)
         st.rerun()
 
 
+def count_shift_changes(original_df: pd.DataFrame, current_df: pd.DataFrame, schema: dict[str, object]) -> int:
+    day_cols: list[str] = list(schema.get("day_cols", []))
+    count = 0
+
+    for idx in current_df.index:
+        if idx not in original_df.index:
+            continue
+
+        for col in day_cols:
+            if col not in original_df.columns or col not in current_df.columns:
+                continue
+
+            old_val = "" if pd.isna(original_df.loc[idx, col]) else str(original_df.loc[idx, col]).strip()
+            new_val = "" if pd.isna(current_df.loc[idx, col]) else str(current_df.loc[idx, col]).strip()
+
+            if old_val != new_val:
+                count += 1
+
+    return count
+
+
+def group_count_lookup(records: pd.DataFrame) -> dict[tuple[str, str, str, str], int]:
+    if records.empty:
+        return {}
+
+    grouped = (
+        records.groupby(["Gün Kolonu", "Yön", "Saat", "Servis Kodu"], dropna=False)
+        .size()
+        .reset_index(name="Kişi Sayısı")
+    )
+
+    lookup: dict[tuple[str, str, str, str], int] = {}
+
+    for _, row in grouped.iterrows():
+        key = (
+            str(row["Gün Kolonu"]),
+            str(row["Yön"]),
+            str(row["Saat"]),
+            str(row["Servis Kodu"]),
+        )
+        lookup[key] = int(row["Kişi Sayısı"])
+
+    return lookup
+
+
+def row_group_key(row: pd.Series) -> tuple[str, str, str, str]:
+    return (
+        str(row.get("Gün Kolonu", "")),
+        str(row.get("Yön", "")),
+        str(row.get("Saat", "")),
+        str(row.get("Servis Kodu", "")),
+    )
+
+
+def person_unique_key(row: pd.Series) -> str:
+    emp = str(row.get("Employee Number", "")).strip()
+
+    if emp:
+        return emp
+
+    return str(row.get("Ad Soyad", "")).strip()
+
+
 def build_change_summary_sheet(
     df: pd.DataFrame,
     records_after: pd.DataFrame,
@@ -1309,121 +1371,114 @@ def build_change_summary_sheet(
 ) -> pd.DataFrame:
     """
     Export için 'Değişiklik Özeti' sheetini üretir.
-    Sadece Kategorize Plan ekranındaki servis kodu değişikliklerini baz alır.
+
+    Karşılaştırma mantığı:
+    - İlk yüklenen roster = original_roster_df
+    - Son durum = active_roster_df + servis kodu değişiklikleri
+
+    Servise kazandırılan personel:
+    - Önceki servis grubu 4 kişi ve altındaysa
+    - Son servis grubu 5 kişi ve üzerine çıktıysa
+    bu personel servis kapsamına kazandırılmış kabul edilir.
     """
+
+    original_df = st.session_state.get("original_roster_df", df).copy().astype("object")
+    current_df = df.copy().astype("object")
 
     overrides = get_service_route_overrides()
 
     metrics = {
-        "Toplam servis kodu değişikliği": 0,
-        "Etkilenen personel sayısı": 0,
-        "Etkilenen gün sayısı": 0,
-        "Etkilenen servis güzergahı": 0,
-        "Yeni eklenen servis grubu": 0,
-        "İptal olan servis grubu": 0,
-        "5 kişiye tamamlanan servis": 0,
-        "4 ve altına düşen riskli servis": 0,
+        "Toplam servis kodu değişikliği": len(overrides),
+        "Toplam vardiya değişikliği": count_shift_changes(original_df, current_df, schema),
+        "Servise kazandırılan toplam personel": 0,
+        "Servis kodu değişikliğiyle kazandırılan personel": 0,
+        "Vardiya değişikliğiyle kazandırılan personel": 0,
+        "5 kişiye tamamlanan servis grubu": 0,
     }
 
-    if not overrides:
-        return pd.DataFrame([{"Metrik": key, "Sayı": value} for key, value in metrics.items()])
-
-    records_before = build_shift_records(df, schema, apply_overrides=False)
+    records_before = build_shift_records(original_df, schema, apply_overrides=False)
 
     if records_before.empty or records_after.empty:
         return pd.DataFrame([{"Metrik": key, "Sayı": value} for key, value in metrics.items()])
 
-    changed_after = records_after[
-        records_after["_override_key"].astype(str).isin(overrides.keys())
-    ].copy()
+    before_counts = group_count_lookup(records_before)
+    after_counts = group_count_lookup(records_after)
 
-    changed_before = records_before[
-        records_before["_override_key"].astype(str).isin(overrides.keys())
-    ].copy()
+    before_events = records_before.drop_duplicates(subset=["_person_day_direction_key"]).copy()
+    after_events = records_after.drop_duplicates(subset=["_person_day_direction_key"]).copy()
 
-    metrics["Toplam servis kodu değişikliği"] = len(overrides)
+    before_by_event = {
+        str(row["_person_day_direction_key"]): row
+        for _, row in before_events.iterrows()
+    }
 
-    if not changed_after.empty:
-        metrics["Etkilenen personel sayısı"] = changed_after["Ad Soyad"].nunique()
-        metrics["Etkilenen gün sayısı"] = changed_after["Gün"].nunique()
+    gained_total: set[str] = set()
+    gained_by_service: set[str] = set()
+    gained_by_shift: set[str] = set()
 
-        affected_routes = set(changed_after["Servis Kodu"].dropna().astype(str))
-        affected_routes |= set(changed_after["Orijinal Servis Kodu"].dropna().astype(str))
-        metrics["Etkilenen servis güzergahı"] = len([x for x in affected_routes if x.strip()])
+    affected_groups: set[tuple[str, str, str, str]] = set()
 
-    before_counts = (
-        records_before
-        .groupby(["Gün", "Yön", "Saat", "Servis Kodu"], dropna=False)
-        .size()
-        .reset_index(name="Önceki Personel Sayısı")
-    )
+    for _, after_row in after_events.iterrows():
+        event_key = str(after_row.get("_person_day_direction_key", ""))
+        before_row = before_by_event.get(event_key)
 
-    after_counts = (
-        records_after
-        .groupby(["Gün", "Yön", "Saat", "Servis Kodu"], dropna=False)
-        .size()
-        .reset_index(name="Son Personel Sayısı")
-    )
+        after_key = row_group_key(after_row)
+        after_count = after_counts.get(after_key, 0)
 
-    compare = before_counts.merge(
-        after_counts,
-        on=["Gün", "Yön", "Saat", "Servis Kodu"],
-        how="outer",
-    )
-
-    compare["Önceki Personel Sayısı"] = compare["Önceki Personel Sayısı"].fillna(0).astype(int)
-    compare["Son Personel Sayısı"] = compare["Son Personel Sayısı"].fillna(0).astype(int)
-
-    affected_keys = set()
-
-    for _, row in changed_before.iterrows():
-        affected_keys.add(
-            (
-                str(row.get("Gün", "")),
-                str(row.get("Yön", "")),
-                str(row.get("Saat", "")),
-                str(row.get("Servis Kodu", "")),
+        if before_row is not None:
+            before_key = row_group_key(before_row)
+            before_count = before_counts.get(before_key, 0)
+            before_time = str(before_row.get("Saat", ""))
+            before_route = str(before_row.get("Servis Kodu", ""))
+        else:
+            before_key = (
+                str(after_row.get("Gün Kolonu", "")),
+                str(after_row.get("Yön", "")),
+                "",
+                "",
             )
-        )
+            before_count = 0
+            before_time = ""
+            before_route = ""
 
-    for _, row in changed_after.iterrows():
-        affected_keys.add(
-            (
-                str(row.get("Gün", "")),
-                str(row.get("Yön", "")),
-                str(row.get("Saat", "")),
-                str(row.get("Servis Kodu", "")),
-            )
-        )
+        after_time = str(after_row.get("Saat", ""))
+        after_route = str(after_row.get("Servis Kodu", ""))
 
-    if affected_keys:
-        compare["_affected"] = compare.apply(
-            lambda r: (
-                str(r["Gün"]),
-                str(r["Yön"]),
-                str(r["Saat"]),
-                str(r["Servis Kodu"]),
-            )
-            in affected_keys,
-            axis=1,
-        )
-        compare = compare[compare["_affected"]].copy()
+        service_changed = before_route != after_route
+        shift_changed = before_time != after_time
 
-    metrics["Yeni eklenen servis grubu"] = int(
-        ((compare["Önceki Personel Sayısı"] == 0) & (compare["Son Personel Sayısı"] > 0)).sum()
-    )
+        if service_changed or shift_changed:
+            affected_groups.add(before_key)
+            affected_groups.add(after_key)
 
-    metrics["İptal olan servis grubu"] = int(
-        ((compare["Önceki Personel Sayısı"] > 0) & (compare["Son Personel Sayısı"] == 0)).sum()
-    )
+        if before_count <= 4 and after_count >= 5:
+            person_key = person_unique_key(after_row)
 
-    metrics["5 kişiye tamamlanan servis"] = int(
-        ((compare["Önceki Personel Sayısı"] <= 4) & (compare["Son Personel Sayısı"] >= 5)).sum()
-    )
+            if person_key:
+                gained_total.add(person_key)
 
-    metrics["4 ve altına düşen riskli servis"] = int(
-        ((compare["Önceki Personel Sayısı"] >= 5) & (compare["Son Personel Sayısı"] <= 4)).sum()
-    )
+                if service_changed:
+                    gained_by_service.add(person_key)
+
+                if shift_changed:
+                    gained_by_shift.add(person_key)
+
+    completed_groups = 0
+
+    for group_key in affected_groups:
+        if not all(group_key):
+            continue
+
+        before_count = before_counts.get(group_key, 0)
+        after_count = after_counts.get(group_key, 0)
+
+        if before_count <= 4 and after_count >= 5:
+            completed_groups += 1
+
+    metrics["Servise kazandırılan toplam personel"] = len(gained_total)
+    metrics["Servis kodu değişikliğiyle kazandırılan personel"] = len(gained_by_service)
+    metrics["Vardiya değişikliğiyle kazandırılan personel"] = len(gained_by_shift)
+    metrics["5 kişiye tamamlanan servis grubu"] = completed_groups
 
     return pd.DataFrame([{"Metrik": key, "Sayı": value} for key, value in metrics.items()])
 
@@ -1521,6 +1576,11 @@ def initialize_from_upload(uploaded_file) -> bool:
     st.session_state["sheet_name"] = sheet_name
     st.session_state["active_roster_df"] = df.copy()
     st.session_state["saved_roster_df"] = df.copy()
+
+    # Export raporu için ilk yüklenen roster saklanır.
+    # Vardiya değişikliği ve servis kazanımı bu ilk roster ile son durum karşılaştırılarak hesaplanır.
+    st.session_state["original_roster_df"] = df.copy()
+
     st.session_state["schema"] = schema
     st.session_state["service_route_overrides"] = {}
 
