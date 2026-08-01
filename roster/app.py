@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -126,7 +126,7 @@ def logo_header() -> None:
             <div class="hero">
                 <div><span class="pill">Roster</span><span class="pill">Servis Planlama</span><span class="pill">Haftalık Saat Kontrolü</span></div>
                 <h1>Çelebi Akıllı Roster Planlama Sistemi</h1>
-                <p>Servis planlama tüm yüklenen günleri okur; haftalık saat hesabı yeni haftanın 7 gününe göre yapılır.</p>
+                <p>Servis planlama tüm yüklenen günleri okur; gece vardiyası çıkışları ertesi güne taşınır.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -639,6 +639,26 @@ def effective_service_code(original_code: object, override_key: str) -> str:
     return str(original_code or "").strip()
 
 
+def get_next_day_col(day_cols: list[str], day_order: int, current_day_col: str) -> tuple[str, int]:
+    """
+    Gece vardiyası çıkışını ertesi güne taşır.
+    Örnek: Pazartesi 20:00-04:30 ise çıkış Salı 04:30 görünür.
+    """
+
+    next_order = day_order + 1
+
+    if next_order < len(day_cols):
+        return str(day_cols[next_order]), next_order
+
+    current_date = parse_date_column(current_day_col)
+
+    if current_date:
+        next_date = current_date + timedelta(days=1)
+        return next_date.strftime("%Y%m%d"), next_order
+
+    return f"{current_day_col} +1", next_order
+
+
 def build_shift_records(
     df: pd.DataFrame,
     schema: dict[str, object],
@@ -692,7 +712,11 @@ def build_shift_records(
                     {
                         **common,
                         "_override_key": key,
-                        "_person_day_direction_key": make_person_day_direction_key(row_index, str(day_col), "Geliş"),
+                        "_person_day_direction_key": make_person_day_direction_key(
+                            row_index,
+                            str(day_col),
+                            "Geliş",
+                        ),
                         "Yön": "Geliş",
                         "Saat": parsed["start"],
                         "Başlangıç": parsed["start"],
@@ -707,18 +731,39 @@ def build_shift_records(
                 )
 
             if parsed.get("end"):
-                key = make_service_override_key(row_index, str(day_col), "Gidiş", str(parsed["end"]))
+                start_min = parsed.get("start_min")
+                end_min = parsed.get("end_min")
+
+                is_overnight = (
+                    start_min is not None
+                    and end_min is not None
+                    and int(end_min) < int(start_min)
+                )
+
+                if is_overnight:
+                    gidiş_day_col, gidiş_day_order = get_next_day_col(day_cols, day_order, str(day_col))
+                else:
+                    gidiş_day_col, gidiş_day_order = str(day_col), day_order
+
+                key = make_service_override_key(row_index, str(gidiş_day_col), "Gidiş", str(parsed["end"]))
 
                 rows.append(
                     {
                         **common,
                         "_override_key": key,
-                        "_person_day_direction_key": make_person_day_direction_key(row_index, str(day_col), "Gidiş"),
+                        "_person_day_direction_key": make_person_day_direction_key(
+                            row_index,
+                            str(gidiş_day_col),
+                            "Gidiş",
+                        ),
                         "Yön": "Gidiş",
+                        "Gün": day_label(str(gidiş_day_col)),
+                        "Gün Sütunu": gidiş_day_order,
+                        "Gün Kolonu": str(gidiş_day_col),
                         "Saat": parsed["end"],
                         "Başlangıç": parsed.get("start"),
                         "Bitiş": parsed["end"],
-                        "Sıralama Dakika": parsed.get("end_min") or 0,
+                        "Sıralama Dakika": int(end_min or 0),
                         "Servis Kodu": (
                             effective_service_code(original_route, key)
                             if apply_overrides
@@ -1369,19 +1414,6 @@ def build_change_summary_sheet(
     records_after: pd.DataFrame,
     schema: dict[str, object],
 ) -> pd.DataFrame:
-    """
-    Export için 'Değişiklik Özeti' sheetini üretir.
-
-    Karşılaştırma mantığı:
-    - İlk yüklenen roster = original_roster_df
-    - Son durum = active_roster_df + servis kodu değişiklikleri
-
-    Servise kazandırılan personel:
-    - Önceki servis grubu 4 kişi ve altındaysa
-    - Son servis grubu 5 kişi ve üzerine çıktıysa
-    bu personel servis kapsamına kazandırılmış kabul edilir.
-    """
-
     original_df = st.session_state.get("original_roster_df", df).copy().astype("object")
     current_df = df.copy().astype("object")
 
@@ -1576,11 +1608,7 @@ def initialize_from_upload(uploaded_file) -> bool:
     st.session_state["sheet_name"] = sheet_name
     st.session_state["active_roster_df"] = df.copy()
     st.session_state["saved_roster_df"] = df.copy()
-
-    # Export raporu için ilk yüklenen roster saklanır.
-    # Vardiya değişikliği ve servis kazanımı bu ilk roster ile son durum karşılaştırılarak hesaplanır.
     st.session_state["original_roster_df"] = df.copy()
-
     st.session_state["schema"] = schema
     st.session_state["service_route_overrides"] = {}
 
@@ -1628,8 +1656,9 @@ def main() -> None:
             2. Eğer rosterda 8 gün varsa servis planlama 8 günü de okur.
             3. Roster düzenlemede geçmiş haftanın son günü gösterilmez.
             4. Haftalık çalışma saati sadece yeni haftanın 7 günü üzerinden hesaplanır.
-            5. Kategorize Plan ekranında seçilen personelin sadece o gün/saat servis kodunu değiştirebilirsin.
-            6. Export içinde “Değişiklik Özeti” sheet’i otomatik oluşur.
+            5. Gece vardiyasında çıkış saati ertesi güne taşınır.
+            6. Kategorize Plan ekranında seçilen personelin sadece o gün/saat servis kodunu değiştirebilirsin.
+            7. Export içinde “Değişiklik Özeti” sheet’i otomatik oluşur.
             """
         )
         return
